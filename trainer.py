@@ -12,6 +12,8 @@ from accelerate import PartialState
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
+
+from torch.utils.tensorboard import SummaryWriter
 # PartialState().is_main_process
 
 
@@ -43,6 +45,7 @@ class Trainer:
         lr=1e-2,
         cosine_T_max=500,
         eval_every=50,
+        tb_log_dir=None,
     ):
         self.accelerator = Accelerator(
             mixed_precision="bf16",
@@ -88,6 +91,11 @@ class Trainer:
         self.save_path = save_path
         self.eval_every = eval_every
         self.last_eval_losses = []
+
+        if tb_log_dir is not None:
+            self.tb_writer = SummaryWriter(log_dir=tb_log_dir, max_queue=5, purge_step=0, flush_secs=3)
+        else:
+            self.tb_writer = None
 
 
     def _step(self, batch, loss_type):
@@ -164,6 +172,9 @@ class Trainer:
                             if PartialState().is_main_process:
                                 print(f"loss = {loss_accumulate / self.micro_num} at epoch {epoch} step {step}")
                             
+                            if self.tb_writer is not None:
+                                self.tb_writer.add_scalars(tag="loss", scalar_value=loss_accumulate / self.micro_num, global_step=step)                                
+
                             loss_accumulate = 0
                             self.optimizer.step()
                             self.scheduler.step()
