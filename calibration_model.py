@@ -46,7 +46,7 @@ class CalibrationDecoder(torch.nn.Module):
     def __init__(self, load_from=None):
         super(CalibrationDecoder, self).__init__()
         if load_from is not None:
-            self.model = AutoModel.from_pretrained(load_from, _attn_implementation="sdpa", torch_dtype="bfloat16")
+            self.model = AutoModel.from_pretrained(load_from, _attn_implementation="flash_attention_2", torch_dtype="bfloat16")
             self.wik = torch.nn.Linear(self.model.config.hidden_size, 2, bias=False, dtype=self.model.dtype)
             self.wik.weight.data.fill_(1)
     
