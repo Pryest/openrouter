@@ -82,9 +82,17 @@ class Trainer:
 
         if eval_data_folder:
             eval_collate_fn = partial(collate_fn, tokenizer=tokenizer, is_hard=(eval_type == "hard"))
-            datasets["eval"] = RouterCollectionDataset(eval_data_folder)
-            dls["eval"] = DataLoader(datasets["eval"], collate_fn=eval_collate_fn, batch_size=eval_batch_size, shuffle=False)
-            self.eval_dl = self.accelerator.prepare(dls["eval"])
+            datasets["eval"] = {}
+            for root, dirs, files in os.walk(eval_data_folder):
+                for file in files:
+                    if file.endswith(".jsonl"):
+                        datasets["eval"][file.replace(".jsonl", "")] = RouterCollectionDataset(os.path.join(root, file))
+            
+            dls["eval"] = {}
+            self.eval_dl = {}
+            for k, v in datasets["eval"].items():
+                dls["eval"][k] = DataLoader(v, collate_fn=eval_collate_fn, batch_size=eval_batch_size, shuffle=False)
+                self.eval_dl[k] = self.accelerator.prepare(dls["eval"][k])
         else:
             self.eval_dl = None
 
@@ -92,7 +100,8 @@ class Trainer:
         self.eval_every = eval_every
         self.last_eval_losses = []
 
-        if tb_log_dir is not None:
+        if tb_log_dir is not None and PartialState().is_main_process:
+            os.makedirs(tb_log_dir, exist_ok=True)
             self.tb_writer = SummaryWriter(log_dir=tb_log_dir, max_queue=5, purge_step=0, flush_secs=3)
         else:
             self.tb_writer = None
@@ -129,26 +138,33 @@ class Trainer:
         
         with torch.no_grad():
             self.model.eval()
+            eval_losses = {}
 
-            loss_numerator = 0.
-            loss_denominator = 0
+            for k, eval_dl in self.eval_dl.items():                
+                loss_numerator = 0.
+                loss_denominator = 0
 
-            with tqdm(self.eval_dl, disable=True) as pbar:
+                with tqdm(eval_dl, disable=True) as pbar:
 
-                for batch in self.eval_dl:
-                    loss = self._step(batch, self.eval_type)
-                    loss_list = self.accelerator.gather_for_metrics(loss)
+                    for batch in eval_dl:
+                        loss = self._step(batch, self.eval_type)
+                        loss_list = self.accelerator.gather_for_metrics(loss)
 
-                    loss_numerator += loss_list.sum().item()
-                    loss_denominator += len(loss_list)
+                        loss_numerator += loss_list.sum().item()
+                        loss_denominator += torch.ones_like(loss_list).sum().item()
 
-                    # pbar.set_postfix_str(f"loss = {loss_numerator / loss_denominator}")
-            
+                        # pbar.set_postfix_str(f"loss = {loss_numerator / loss_denominator}")
+
+                eval_losses[k] = loss_numerator / loss_denominator
+
+                self.accelerator.wait_for_everyone()
+
             if PartialState().is_main_process:
                 print("Evaluation finished.")
-                print(f"Final eval loss = {loss_numerator / loss_denominator} by {ckpt_name}", flush=True)
-            
-        return loss_numerator / loss_denominator
+                for k, v in eval_losses.items():
+                    print(f"Eval loss/{k} = {v} by {ckpt_name}", flush=True)
+
+        return eval_losses
 
 
     def train_(self, max_epochs=1):
@@ -173,7 +189,7 @@ class Trainer:
                                 print(f"loss = {loss_accumulate / self.micro_num} at epoch {epoch} step {step}")
                             
                             if self.tb_writer is not None:
-                                self.tb_writer.add_scalars(tag="loss", scalar_value=loss_accumulate / self.micro_num, global_step=step)                                
+                                self.tb_writer.add_scalar(tag="loss", scalar_value=loss_accumulate / self.micro_num, global_step=step)                                
 
                             loss_accumulate = 0
                             self.optimizer.step()
@@ -182,8 +198,11 @@ class Trainer:
 
                             if (step // self.micro_num) % self.eval_every == 0:
                                 if self.eval_dl is not None:
-                                    loss = self.eval(f"epoch_{epoch}_step_{step}.pt")
-                                    self.last_eval_losses.append(loss)
+                                    losses = self.eval(f"epoch_{epoch}_step_{step}.pt")
+                                    if self.tb_writer is not None:
+                                        for k, v in losses.items():
+                                            self.tb_writer.add_scalar(tag=f"loss/{k}", scalar_value=v, global_step=step)
+                                    self.last_eval_losses.append(losses)
                                     self.model.train()
                                 self.save_model(f"epoch_{epoch}_step_{step}.pt")
                         
@@ -198,8 +217,11 @@ class Trainer:
             self.accelerator.wait_for_everyone()
 
             if self.eval_dl is not None:
-                loss = self.eval(f"epoch_{epoch}.pt")
-                self.last_eval_losses.append(loss)
+                losses = self.eval(f"epoch_{epoch}.pt")
+                if self.tb_writer is not None:
+                    for k, v in losses.items():
+                        self.tb_writer.add_scalar(tag=f"loss/{k}", scalar_value=v, global_step=step)
+                self.last_eval_losses.append(losses)
             
             self.save_model(f"epoch_{epoch}.pt")
 

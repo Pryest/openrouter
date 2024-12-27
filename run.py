@@ -19,7 +19,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_every", type=int, default=50)
     parser.add_argument("--tb_log_dir", type=str, default=None)
 
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
 
     model = CalibrationDecoder(args.model)
     model.model.gradient_checkpointing_enable()
