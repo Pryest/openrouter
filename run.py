@@ -18,6 +18,10 @@ if __name__ == "__main__":
     parser.add_argument("--t_max", type=int, default=500)
     parser.add_argument("--eval_every", type=int, default=50)
     parser.add_argument("--tb_log_dir", type=str, default=None)
+    parser.add_argument("--try_resume", action="store_true")
+    parser.add_argument("--train_type", type=str, default="hard")
+    parser.add_argument("--eval_type", type=str, default="soft")
+
 
     args, unknown_args = parser.parse_known_args()
 
@@ -43,6 +47,9 @@ if __name__ == "__main__":
         cosine_T_max=args.t_max,
         eval_every=args.eval_every,
         tb_log_dir=args.tb_log_dir,
+        try_resume=args.try_resume,
+        train_type=args.train_type,
+        eval_type=args.eval_type
     )
 
     trainer.train()
