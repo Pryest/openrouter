@@ -3,6 +3,7 @@ import torch
 from dataset import RouterCollectionDataset
 
 import os
+import shutil
 from functools import partial
 
 from accelerate import Accelerator
@@ -27,7 +28,7 @@ def collate_fn(batch, tokenizer, is_hard):
         texts.append(item["prompt"])
         labels.append(item["passed"])
     inputs = tokenizer(texts, return_tensors="pt", truncation=True, max_length=128, pad_to_max_length=True)
-    labels = torch.tensor(labels, dtype=torch.long if is_hard else torch.bfloat16)
+    labels = torch.tensor(labels, dtype=torch.long if is_hard else torch.float32)
     return inputs, labels
 
 
@@ -54,19 +55,8 @@ class Trainer:
         
         self.tokenizer = tokenizer
         
-        if try_resume and os.path.exists(save_path):
-            last = (-1, -1)
-            for save_ckpts in os.listdir(save_path):
-                ckpt_name = os.path.basename(save_ckpts)
-                epoch_step = re.findall(r"epoch_(\d+)_step_(\d+)\.pt", ckpt_name)
-                if epoch_step:
-                    epoch, step = [int(_) for _ in epoch_step[0]]
-                    last = max(last, (epoch, step))
-
-            if last == (-1, -1):
-                last_ckpt = None
-            else:
-                last_ckpt = f"epoch_{last[0]}_step_{last[1]}"
+        if try_resume:
+            last_ckpt = self.find_last_ckpt(save_path)
         else:
             last_ckpt = None
 
@@ -162,6 +152,8 @@ class Trainer:
 
     def save_model(self, special_name):
 
+        last_ckpt = self.find_last_ckpt(self.save_path)
+
         model_state_dict = self.accelerator.get_state_dict(self.model)
 
         if PartialState().is_main_process:
@@ -171,6 +163,9 @@ class Trainer:
         
         if self.try_resume:
             self.accelerator.save_state(os.path.join(self.save_path, special_name.replace(".pt", "")))
+
+            if last_ckpt is not None and PartialState().is_main_process:
+                shutil.rmtree(os.path.join(self.save_path, last_ckpt.replace(".pt", "")))
         
         self.accelerator.wait_for_everyone()
     
@@ -181,7 +176,7 @@ class Trainer:
         if self.eval_data_folder:
             eval_data_folder = self.eval_data_folder
             eval_collate_fn = partial(collate_fn, tokenizer=self.tokenizer, is_hard=(self.eval_type == "hard"))
-            datasets, dls = {}
+            datasets, dls = {}, {}
             datasets["eval"] = {}
             for root, dirs, files in os.walk(eval_data_folder):
                 for file in files:
@@ -278,16 +273,36 @@ class Trainer:
             self.accelerator.wait_for_everyone()
 
             if self.eval_dl is not None:
-                losses = self.eval(f"epoch_{epoch}.pt")
+                losses = self.eval(f"epoch_{epoch}_step_{step}.pt")
                 if self.tb_writer is not None:
                     for k, v in losses.items():
                         self.tb_writer.add_scalar(tag=f"loss/{k}", scalar_value=v, global_step=step)
                 self.last_eval_losses.append(losses)
             
-            self.save_model(f"epoch_{epoch}.pt")
+            self.save_model(f"epoch_{epoch}_step_{step}.pt")
 
         self.accelerator.end_training()
 
 
     def train(self):
         self.train_(self.max_epochs)
+
+
+    def find_last_ckpt(self, save_path):
+        if not os.path.exists(save_path):
+            return None
+
+        last = (-1, -1)
+        for save_ckpts in os.listdir(save_path):
+            ckpt_name = os.path.basename(save_ckpts)
+            epoch_step = re.findall(r"epoch_(\d+)_step_(\d+)\.pt", ckpt_name)
+            if epoch_step:
+                epoch, step = [int(_) for _ in epoch_step[0]]
+                last = max(last, (epoch, step))
+
+        if last == (-1, -1):
+            last_ckpt = None
+        else:
+            last_ckpt = f"epoch_{last[0]}_step_{last[1]}"
+
+        return last_ckpt
