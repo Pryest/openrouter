@@ -75,11 +75,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    prefix = None
+    prefix = "/fs-computility/llmdelivery/YOURNAMEHERE/ckpts/0103/"
     ft_path = args.ft_path
     print(ft_path)
 
-    model_prefix = None
+    model_prefix = "/fs-computility/llm/shared/llmeval/models/opencompass_hf_hub/"
 
     local_models = {
         "llama-7b":f"{model_prefix}/models--huggyllama--llama-7b/snapshots/4782ad278652c7c71b72204d462d6d01eaaf7549",

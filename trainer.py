@@ -165,7 +165,7 @@ class Trainer:
             self.accelerator.save_state(os.path.join(self.save_path, special_name.replace(".pt", "")))
 
             if last_ckpt is not None and PartialState().is_main_process:
-                shutil.rmtree(os.path.join(self.save_path, last_ckpt.replace(".pt", "")))
+                shutil.rmtree(os.path.join(self.save_path, last_ckpt.replace(".pt", "")), ignore_errors=True)
         
         self.accelerator.wait_for_everyone()
     
