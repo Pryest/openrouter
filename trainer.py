@@ -17,19 +17,55 @@ from tqdm import tqdm
 
 import re
 
+import json
 from torch.utils.tensorboard import SummaryWriter
 # PartialState().is_main_process
 
 
-def collate_fn(batch, tokenizer, is_hard):
-    texts = []
-    labels = []
-    for item in batch:
-        texts.append(item["prompt"])
-        labels.append(item["passed"])
-    inputs = tokenizer(texts, return_tensors="pt", truncation=True, max_length=128, pad_to_max_length=True)
-    labels = torch.tensor(labels, dtype=torch.long if is_hard else torch.float32)
-    return inputs, labels
+def collate_fn(batch, tokenizer, type):
+    if tokenizer is None:
+        logits = []
+        labels = []
+        for item in batch:
+            logits.append(item["logits"])
+            if type == "original":
+                labels.append(item["base_passed"])
+            elif type in ["soft", "hard", "sign"]:
+                if "passed_for_train" in item:
+                    labels.append(item["passed_for_train"])
+                elif "passed_with_failed_ref" not in item:
+                    labels.append(item["base_passed"])
+                else:
+                    labels.append(item["passed_with_failed_ref"])
+            elif type == "half":
+                labels.append(item["half_passed"])     
+            else:
+                raise ValueError(f"Unknown type {type}")           
+        logits = torch.stack(logits, dim=0).to(dtype=torch.float32)
+        labels = torch.tensor(labels, dtype=torch.float32 if type == "soft" else torch.long)
+        return {"hidden_states": logits}, labels
+    else:
+        texts = []
+        labels = []
+        for item in batch:
+            texts.append(item["prompt"])
+            if type == "original":
+                labels.append(item["base_passed"])
+            elif type in ["soft", "hard", "sign"]:
+                if "passed_for_train" in item:
+                    labels.append(item["passed_for_train"])
+                elif "passed_with_failed_ref" not in item:
+                    labels.append(item["base_passed"])
+                else:
+                    labels.append(item["passed_with_failed_ref"])
+            elif type == "half":
+                labels.append(item["half_passed"]) 
+            else:
+                raise ValueError(f"Unknown type {type}")   
+        inputs = tokenizer(texts, return_tensors="pt", truncation=True, max_length=128, pad_to_max_length=True)
+        labels = torch.tensor(labels, dtype=torch.float32 if type == "soft" else torch.long)
+
+        return inputs, labels
 
 
 class Trainer:
@@ -51,6 +87,7 @@ class Trainer:
         eval_every=50,
         tb_log_dir=None,
         try_resume=False,
+        train_enc=False,
     ):
         
         self.tokenizer = tokenizer
@@ -60,15 +97,25 @@ class Trainer:
         else:
             last_ckpt = None
 
-        self.accelerator = Accelerator(
-            mixed_precision="bf16",
-            dataloader_config=DataLoaderConfiguration(
-                use_stateful_dataloader=True
-            ),
-        )
-    
-        assert train_type in ["hard", "soft"]
-        assert eval_type in ["hard", "soft"]
+        if train_enc:
+            from accelerate import DistributedDataParallelKwargs
+            self.accelerator = Accelerator(
+                dataloader_config=DataLoaderConfiguration(
+                    use_stateful_dataloader=True
+                ),
+                kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+            )
+        else:
+        
+            self.accelerator = Accelerator(
+                mixed_precision="bf16",
+                dataloader_config=DataLoaderConfiguration(
+                    use_stateful_dataloader=True
+                ),
+            )
+        
+        # assert train_type in ["hard", "soft", "half", "original"]
+        # assert eval_type in ["hard"]
 
         self.train_type = train_type
         self.eval_type = eval_type
@@ -89,8 +136,8 @@ class Trainer:
             self.scheduler = self.accelerator.prepare(scheduler)
 
         if train_data_folder:
-            train_collate_fn = partial(collate_fn, tokenizer=tokenizer, is_hard=(train_type == "hard"))
-            datasets["train"] = RouterCollectionDataset(train_data_folder)
+            train_collate_fn = partial(collate_fn, tokenizer=tokenizer, type=train_type)
+            datasets["train"] = RouterCollectionDataset(train_data_folder, self.tokenizer is None)
             dls["train"] = DataLoader(datasets["train"], collate_fn=train_collate_fn, batch_size=train_batch_size, shuffle=True)
             self.train_dl = self.accelerator.prepare(dls["train"])
         else:
@@ -100,12 +147,12 @@ class Trainer:
             self.eval_data_folder = eval_data_folder
             self.eval_type = eval_type
             self.eval_batch_size = eval_batch_size
-            eval_collate_fn = partial(collate_fn, tokenizer=tokenizer, is_hard=(eval_type == "hard"))
+            eval_collate_fn = partial(collate_fn, tokenizer=tokenizer, type=eval_type)
             datasets["eval"] = {}
             for root, dirs, files in os.walk(eval_data_folder):
                 for file in files:
                     if file.endswith(".jsonl"):
-                        datasets["eval"][file.replace(".jsonl", "")] = RouterCollectionDataset(os.path.join(root, file))
+                        datasets["eval"][file.replace(".jsonl", "")] = RouterCollectionDataset(os.path.join(root, file), self.tokenizer is None)
             
             dls["eval"] = {}
             self.eval_dl = {}
@@ -122,8 +169,17 @@ class Trainer:
         if try_resume:
             self.try_resume = True
             if last_ckpt is not None:
-                self.accelerator.load_state(os.path.join(self.save_path, last_ckpt))
-                self.epoch, self.step = [int(_) for _ in re.findall(r"epoch_(\d+)_step_(\d+)", last_ckpt)[0]]
+                try:
+                    self.accelerator.load_state(os.path.join(self.save_path, last_ckpt))
+                    self.epoch, self.step = [int(_) for _ in re.findall(r"epoch_(\d+)_step_(\d+)", last_ckpt)[0]]
+                except:
+                    shutil.rmtree(os.path.join(self.save_path, last_ckpt), ignore_errors=True)
+                    last_ckpt = self.find_last_ckpt(self.save_path)
+                    if last_ckpt is not None:
+                        self.accelerator.load_state(os.path.join(self.save_path, last_ckpt))
+                        self.epoch, self.step = [int(_) for _ in re.findall(r"epoch_(\d+)_step_(\d+)", last_ckpt)[0]]
+                    else:
+                        self.epoch, self.step = 0, 0
             else:
                 self.epoch, self.step = 0, 0
         else:
@@ -136,17 +192,23 @@ class Trainer:
         else:
             self.tb_writer = None
 
+        torch.manual_seed(1001)
+        torch.cuda.manual_seed(1001)
+        torch.cuda.manual_seed_all(1001)
 
-    def _step(self, batch, loss_type):
+    def _step(self, batch, loss_type, return_p=False):
         inputs, labels = batch
         logits = self.model(**inputs)
-        if loss_type == "hard":
+        if loss_type != "soft":
             loss_list = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
         else:
             loss_0_list = torch.nn.functional.cross_entropy(logits, torch.zeros(labels.size(), dtype=torch.long, device=logits.device), reduction="none")
             loss_1_list = torch.nn.functional.cross_entropy(logits, torch.ones(labels.size(), dtype=torch.long, device=logits.device), reduction="none")
             loss_list = labels * loss_1_list + (1 - labels) * loss_0_list
         
+        if return_p:
+            return loss_list.mean(), torch.nn.functional.softmax(logits, dim=-1)[:, 1]
+
         return loss_list.mean()
 
 
@@ -154,12 +216,12 @@ class Trainer:
 
         last_ckpt = self.find_last_ckpt(self.save_path)
 
-        model_state_dict = self.accelerator.get_state_dict(self.model)
+        # model_state_dict = self.accelerator.get_state_dict(self.model)
 
-        if PartialState().is_main_process:
-            os.makedirs(self.save_path, exist_ok=True)
-            torch.save(model_state_dict, os.path.join(self.save_path, special_name))
-            print(f"Model successfully saved to {os.path.join(self.save_path, special_name)}")
+        # if PartialState().is_main_process:
+            # os.makedirs(self.save_path, exist_ok=True)
+            # torch.save(model_state_dict, os.path.join(self.save_path, special_name))
+            # print(f"Model successfully saved to {os.path.join(self.save_path, special_name)}")
         
         if self.try_resume:
             self.accelerator.save_state(os.path.join(self.save_path, special_name.replace(".pt", "")))
@@ -170,18 +232,18 @@ class Trainer:
         self.accelerator.wait_for_everyone()
     
 
-    def eval(self, ckpt_name):
+    def eval(self, ckpt_name, end_of_epoch=False):
         assert self.eval_dl is not None
 
         if self.eval_data_folder:
             eval_data_folder = self.eval_data_folder
-            eval_collate_fn = partial(collate_fn, tokenizer=self.tokenizer, is_hard=(self.eval_type == "hard"))
+            eval_collate_fn = partial(collate_fn, tokenizer=self.tokenizer, type=self.eval_type)
             datasets, dls = {}, {}
             datasets["eval"] = {}
             for root, dirs, files in os.walk(eval_data_folder):
                 for file in files:
                     if file.endswith(".jsonl"):
-                        datasets["eval"][file.replace(".jsonl", "")] = RouterCollectionDataset(os.path.join(root, file))
+                        datasets["eval"][file.replace(".jsonl", "")] = RouterCollectionDataset(os.path.join(root, file), self.tokenizer is None)
             
             dls["eval"] = {}
             self.eval_dl = {}
@@ -200,10 +262,17 @@ class Trainer:
                 loss_numerator = 0.
                 loss_denominator = 0
 
+                ps = []
                 with tqdm(eval_dl, disable=True) as pbar:
 
                     for batch in eval_dl:
-                        loss = self._step(batch, self.eval_type)
+                        if end_of_epoch:
+                            loss, p= self._step(batch, self.eval_type, return_p=True)
+                            p_list = self.accelerator.gather_for_metrics(p)
+                            ps += p_list.tolist()
+                        else:
+                            loss = self._step(batch, self.eval_type)
+
                         loss_list = self.accelerator.gather_for_metrics(loss)
 
                         loss_numerator += loss_list.sum().item()
@@ -214,6 +283,12 @@ class Trainer:
                 eval_losses[k] = loss_numerator / loss_denominator
 
                 self.accelerator.wait_for_everyone()
+
+                if end_of_epoch:
+                    img_dir = os.path.join(self.save_path, "eval", k)
+                    os.makedirs(img_dir, exist_ok=True)
+                    with open(os.path.join(img_dir, ckpt_name.replace(".pt", ".json")), "w") as f:
+                        f.write(json.dumps(ps))
 
             if PartialState().is_main_process:
                 print("Evaluation finished.")
@@ -273,7 +348,7 @@ class Trainer:
             self.accelerator.wait_for_everyone()
 
             if self.eval_dl is not None:
-                losses = self.eval(f"epoch_{epoch}_step_{step}.pt")
+                losses = self.eval(f"epoch_{epoch}_step_{step}.pt", end_of_epoch=True)
                 if self.tb_writer is not None:
                     for k, v in losses.items():
                         self.tb_writer.add_scalar(tag=f"loss/{k}", scalar_value=v, global_step=step)
@@ -295,7 +370,7 @@ class Trainer:
         last = (-1, -1)
         for save_ckpts in os.listdir(save_path):
             ckpt_name = os.path.basename(save_ckpts)
-            epoch_step = re.findall(r"epoch_(\d+)_step_(\d+)\.pt", ckpt_name)
+            epoch_step = re.findall(r"epoch_(\d+)_step_(\d+)", ckpt_name)
             if epoch_step:
                 epoch, step = [int(_) for _ in epoch_step[0]]
                 last = max(last, (epoch, step))

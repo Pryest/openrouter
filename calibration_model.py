@@ -6,8 +6,10 @@ from transformers import AutoModel
 class CalibrationLinear(torch.nn.Module):
     def __init__(self, hidden_size):
         super(CalibrationLinear, self).__init__()
-        self.wik = torch.nn.Linear(hidden_size, 2, dtype=torch.float32)
-        self.wik.weight.data.fill_(0)
+        self.wik = torch.nn.Linear(hidden_size, 2, dtype=torch.float32, bias=False)
+        torch.manual_seed(1001)
+        torch.nn.init.normal_(self.wik.weight.data, mean=0.0, std=1)
+        print(self.wik.weight.data, flush=True)
     
     def forward(self, hidden_states):
         return self.wik(hidden_states)
@@ -20,17 +22,45 @@ class CalibrationLinear(torch.nn.Module):
         self.wik.load_state_dict(torch.load(os.path.join(path, "wik.pt")))
 
 
+class CalibrationMLP(torch.nn.Module):
+    def __init__(self, hidden_size, intermediate_size):
+        super(CalibrationMLP, self).__init__()
+        self.wik = torch.nn.Sequential(
+            torch.nn.Linear(hidden_size, intermediate_size, dtype=torch.float32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(intermediate_size, 2, dtype=torch.float32)
+        )
+        torch.manual_seed(1001)
+        torch.nn.init.normal_(self.wik[0].weight.data, mean=0.0, std=1)
+        print(self.wik[0].weight.data, flush=True)
+        torch.nn.init.normal_(self.wik[2].weight.data, mean=0.0, std=1)
+        print(self.wik[2].weight.data, flush=True)
+
+    def forward(self, hidden_states):
+        return self.wik(hidden_states)
+
+    def save(self, path):
+        os.makedirs(path, exist_ok=True)
+        torch.save(self.wik.state_dict(), os.path.join(path, "wik.pt"))
+    
+    def load(self, path):
+        self.wik.load_state_dict(torch.load(os.path.join(path, "wik.pt")))
+
+
 class CalibrationEncoder(torch.nn.Module):
     def __init__(self, load_from=None):
         super(CalibrationEncoder, self).__init__()
         if load_from is not None:
-            self.model = AutoModel.from_pretrained(load_from)
+            self.model = AutoModel.from_pretrained(load_from).to(torch.float32)
             self.wik = torch.nn.Linear(self.model.config.hidden_size, 2, bias=False, dtype=torch.float32)
-            self.wik.weight.data.fill_(0)
+            torch.manual_seed(1001)
+            torch.nn.init.normal_(self.wik.weight.data, mean=0.0, std=1)
+            print(self.wik.weight.data, flush=True)
+            
     
     def forward(self, *args, **kwargs):
         hidden_states = self.model(*args, **kwargs).last_hidden_state
-        logits = self.wik(hidden_states)[:, 0]
+        logits = self.wik(hidden_states[:, 0])
         return logits
     
     def save(self, path):
@@ -51,11 +81,13 @@ class CalibrationDecoder(torch.nn.Module):
             else:
                 self.model = AutoModel.from_pretrained(load_from, torch_dtype="bfloat16")
             self.wik = torch.nn.Linear(self.model.config.hidden_size, 2, bias=False, dtype=torch.float32)
-            self.wik.weight.data.fill_(1)
+            torch.manual_seed(1001)
+            torch.nn.init.normal_(self.wik.weight.data, mean=0.0, std=1)
+            print(self.wik.weight.data, flush=True)
     
     def forward(self, *args, **kwargs):
         hidden_states = self.model(*args, **kwargs).last_hidden_state
-        logits = self.wik(hidden_states)[:, -1]
+        logits = self.wik(hidden_states[:, -1])
         return logits
     
     def save(self, path):
@@ -75,7 +107,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    prefix = "/fs-computility/llmdelivery/YOURNAMEHERE/ckpts/0103/"
+    prefix = "/fs-computility/llmdelivery/$USER/ckpts/0108/"
     ft_path = args.ft_path
     print(ft_path)
 
